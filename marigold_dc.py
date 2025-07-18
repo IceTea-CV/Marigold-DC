@@ -26,9 +26,21 @@ import numpy as np
 import torch
 from diffusers import DDIMScheduler, MarigoldDepthPipeline
 from PIL import Image
+from pdb import set_trace as bb
+import gc
+from eval_metric import calculate_depth_rmse
+
+def clear_gpu_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 diffusers.utils.logging.disable_progress_bar()
+
+
 
 class MarigoldDepthCompletionPipeline(MarigoldDepthPipeline):
     """
@@ -181,16 +193,255 @@ class MarigoldDepthCompletionPipeline(MarigoldDepthPipeline):
         return prediction.squeeze()
     
 
+class MarigoldDepthCompletionPipeline_fp16(MarigoldDepthPipeline):
+    """
+    Pipeline for Marigold Depth Completion.
+    Extends the MarigoldDepthPipeline to include depth completion functionality.
+    """
+    def __call__(
+        self, image: Image.Image, sparse_depth: np.ndarray,
+        num_inference_steps: int = 50, processing_resolution: int = 768, seed: int = 2024,
+        use_fp16: bool = True
+    ) -> np.ndarray:
+        
+        """
+        Args:
+            image (PIL.Image.Image): Input image of shape [H, W] with 3 channels.
+            sparse_depth (np.ndarray): Sparse depth guidance of shape [H, W].
+            num_inference_steps (int, optional): Number of denoising steps. Defaults to 50.
+            processing_resolution (int, optional): Resolution for processing. Defaults to 768.
+            seed (int, optional): Random seed. Defaults to 2024.
+            use_fp16 (bool, optional): Whether to use mixed precision. Defaults to True.
+
+        Returns:
+            np.ndarray: Dense depth prediction of shape [H, W].
+
+        """
+        # Resolving variables
+        device = self._execution_device
+        generator = torch.Generator(device=device).manual_seed(seed)
+        
+        # Set up dtype based on use_fp16
+        compute_dtype = torch.float16 if use_fp16 else torch.float32
+        
+        # Initialize GradScaler for mixed precision training
+        scaler = torch.amp.GradScaler('cuda') if use_fp16 else None
+
+        # Check inputs.
+        if num_inference_steps is None:
+            raise ValueError("Invalid num_inference_steps")
+        if type(sparse_depth) is not np.ndarray or sparse_depth.ndim != 2:
+            raise ValueError("Sparse depth should be a 2D numpy ndarray with zeros at missing positions")
+
+        # Prepare empty text conditioning
+        with torch.no_grad():
+            if self.empty_text_embedding is None:
+                text_inputs = self.tokenizer("", padding="do_not_pad", 
+                    max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
+                text_input_ids = text_inputs.input_ids.to(device)
+                self.empty_text_embedding = self.text_encoder(text_input_ids)[0]  # [1,2,1024]
+                del text_inputs, text_input_ids, self.tokenizer
+
+                del self.text_encoder
+                clear_gpu_memory()
+
+        # Preprocess input images
+        image, padding, original_resolution = self.image_processor.preprocess(
+            image, processing_resolution=processing_resolution, device=device, dtype=compute_dtype
+        )  # [N,3,PPH,PPW]
+        
+        # Check sparse depth dimensions
+        if sparse_depth.shape != original_resolution:
+            raise ValueError(
+                f"Sparse depth dimensions ({sparse_depth.shape}) must match that of the image ({image.shape[-2:]})"
+            )
+        
+        # Encode input image into latent space
+        with torch.no_grad():
+            if use_fp16:
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    image_latent, pred_latent = self.prepare_latents(image, None, generator, 1, 1)
+            else:
+                image_latent, pred_latent = self.prepare_latents(image, None, generator, 1, 1)
+        del image
+        clear_gpu_memory()
+
+        # Preprocess sparse depth - keep in float32 for numerical stability
+        sparse_depth = torch.from_numpy(sparse_depth)[None, None].float().to(device)
+        sparse_mask = sparse_depth > 0
+        logging.info(f"Using {sparse_mask.int().sum().item()} guidance points")
+
+        # Set up optimization targets and compute the range and lower bound of the sparse depth
+        # Keep all parameters in float32 for numerical stability and to avoid GradScaler issues
+        scale = torch.nn.Parameter(torch.ones(1, device=device, dtype=torch.float32))
+        shift = torch.nn.Parameter(torch.ones(1, device=device, dtype=torch.float32))
+        pred_latent = torch.nn.Parameter(pred_latent.float())  # Keep in float32 to avoid unscale issues
+        
+        sparse_range = (sparse_depth[sparse_mask].max() - sparse_depth[sparse_mask].min()).item() # (cmax − cmin)
+        sparse_lower = (sparse_depth[sparse_mask].min()).item() # cmin
+        
+        # Set up optimizer with adjusted learning rates for mixed precision
+        lr_scale_shift = 0.005 if not use_fp16 else 0.01  # Slightly higher LR for FP16
+        lr_latent = 0.05 if not use_fp16 else 0.1
+        
+        optimizer = torch.optim.Adam([
+            {"params": [scale, shift], "lr": lr_scale_shift},
+            {"params": [pred_latent], "lr": lr_latent}
+        ])
+
+        def affine_to_metric(depth: torch.Tensor) -> torch.Tensor:
+            # Convert affine invariant depth predictions to metric depth predictions using the parametrized scale and shift. See Equation 2 of the paper.
+            # Convert to float32 for numerical stability in scaling operations
+            depth_f32 = depth.float()
+            scale_f32 = scale.float()
+            shift_f32 = shift.float()
+            result = (scale_f32**2) * sparse_range * depth_f32 + (shift_f32**2) * sparse_lower
+            return result
+
+        def latent_to_metric(latent: torch.Tensor) -> torch.Tensor:
+            # Decode latent to affine invariant depth predictions and subsequently to metric depth predictions.
+            with torch.amp.autocast('cuda', dtype=torch.float16, enabled=use_fp16):
+                affine_invariant_prediction = self.decode_prediction(latent)  # [E,1,PPH,PPW]
+            
+            # Convert to float32 for metric conversion
+            prediction = affine_to_metric(affine_invariant_prediction)
+            prediction = self.image_processor.unpad_image(prediction, padding)  # [E,1,PH,PW]
+            prediction = self.image_processor.resize_antialias(
+                prediction, original_resolution, "bilinear", is_aa=False
+            )  # [1,1,H,W]
+            return prediction
+
+        def loss_l1l2(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+            # Compute L1 and L2 loss between input and target.
+            # Ensure both tensors are in float32 for loss computation
+            input_f32 = input.float()
+            target_f32 = target.float()
+            out_l1 = torch.nn.functional.l1_loss(input_f32, target_f32)
+            out_l2 = torch.nn.functional.mse_loss(input_f32, target_f32)
+            out = out_l1 + out_l2
+            return out
+
+        # Denoising loop
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        for _, t in enumerate(
+            self.progress_bar(self.scheduler.timesteps, desc=f"Marigold-DC steps ({str(device)})...")
+        ):
+            optimizer.zero_grad()
+
+            # Forward pass through the U-Net with autocast
+            batch_latent = torch.cat([image_latent, pred_latent.to(compute_dtype)], dim=1)  # [1,8,h,w]
+            
+            if use_fp16:
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    noise = self.unet(
+                        batch_latent, t, encoder_hidden_states=self.empty_text_embedding, return_dict=False
+                    )[0]  # [1,4,h,w]
+            else:
+                noise = self.unet(
+                    batch_latent, t, encoder_hidden_states=self.empty_text_embedding, return_dict=False
+                )[0]  # [1,4,h,w]
+
+            del batch_latent
+
+            # Compute pred_epsilon to later rescale the depth latent gradient
+            with torch.no_grad():
+                alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                beta_prod_t = 1 - alpha_prod_t
+                pred_epsilon = (alpha_prod_t**0.5) * noise + (beta_prod_t**0.5) * pred_latent.to(compute_dtype)
+
+            step_output = self.scheduler.step(noise, t, pred_latent.to(compute_dtype), generator=generator)
+
+            # Preview the final output depth with Tweedie's formula (See Equation 1 of the paper)
+            pred_original_sample = step_output.pred_original_sample
+
+            # Decode to metric space, compute loss with guidance and backpropagate
+            current_metric_estimate = latent_to_metric(pred_original_sample)
+            loss = loss_l1l2(current_metric_estimate[sparse_mask], sparse_depth[sparse_mask])
+
+            # Backward pass with gradient scaling
+            if use_fp16 and scaler is not None:
+                scaler.scale(loss).backward()
+                # Scale gradients up with numerical stability checks
+                with torch.no_grad():
+                    # Unscale gradients to get true gradient norms
+                    scaler.unscale_(optimizer)
+                    
+                    pred_epsilon_norm = torch.linalg.norm(pred_epsilon.float()).item()
+                    if pred_latent.grad is not None:
+                        depth_latent_grad_norm = torch.linalg.norm(pred_latent.grad).item()  # Already float32
+                        if depth_latent_grad_norm > 1e-8:  # Avoid division by zero
+                            scaling_factor = pred_epsilon_norm / depth_latent_grad_norm
+                            # Clamp scaling factor to avoid extreme values
+                            scaling_factor = torch.clamp(torch.tensor(scaling_factor), 0.1, 10.0).item()
+                            pred_latent.grad *= scaling_factor
+                
+                # Check for inf/nan gradients and step
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                # Scale gradients up
+                with torch.no_grad():
+                    pred_epsilon_norm = torch.linalg.norm(pred_epsilon).item()
+                    if pred_latent.grad is not None:
+                        depth_latent_grad_norm = torch.linalg.norm(pred_latent.grad).item()
+                        if depth_latent_grad_norm > 1e-8:
+                            scaling_factor = pred_epsilon_norm / depth_latent_grad_norm
+                            scaling_factor = torch.clamp(torch.tensor(scaling_factor), 0.1, 10.0).item()
+                            pred_latent.grad *= scaling_factor
+                optimizer.step()
+            
+            # Execute update of the latent with regular denoising diffusion step
+            torch.cuda.empty_cache()
+            with torch.no_grad():
+                pred_latent.data = self.scheduler.step(noise, t, pred_latent.to(compute_dtype), generator=generator).prev_sample.float()
+
+            del pred_original_sample, current_metric_estimate, step_output, pred_epsilon, noise
+            torch.cuda.empty_cache()
+
+        del image_latent
+
+        # Decode predictions from latent into pixel space
+        with torch.no_grad():
+            prediction = latent_to_metric(pred_latent.detach())
+
+        # return Numpy array
+        prediction = self.image_processor.pt_to_numpy(prediction)  # [N,H,W,1]
+        self.maybe_free_model_hooks()
+
+        return prediction.squeeze()
+
+
+
+def create_random_mask(shape, ratio, seed=42):
+    """
+    return 2-dim mask array
+    """
+    np.random.seed(seed)
+    
+    total_elements = np.prod(shape)
+    num_true = int(total_elements * ratio)
+    
+    flat_mask = np.zeros(total_elements, dtype=bool)
+    flat_mask[:num_true] = True
+    np.random.shuffle(flat_mask)
+    
+    mask = flat_mask.reshape(shape)
+    
+    return mask
+
 def main():
     parser = argparse.ArgumentParser(description="Marigold-DC Pipeline")
 
     DEPTH_CHECKPOINT = "prs-eth/marigold-depth-v1-0"
     parser.add_argument("--in-image", type=str, default="data/image.png", help="Input image")
-    parser.add_argument("--in-depth", type=str, default="data/sparse_100.npy", help="Input sparse depth")
-    parser.add_argument("--out-depth", type=str, default="data/dense_100.npy", help="Output dense depth")
+    parser.add_argument("--in-depth", type=str, default="data/sparse_1000.npy", help="Input sparse depth")
+    parser.add_argument("--out-depth", type=str, default="data/dense_1000.npy", help="Output dense depth")
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Denoising steps")
     parser.add_argument("--processing_resolution", type=int, default=768, help="Denoising resolution")
     parser.add_argument("--checkpoint", type=str, default=DEPTH_CHECKPOINT, help="Depth checkpoint")
+    parser.add_argument("--seed", type=int, default=2024, help="random seed")
+
     args = parser.parse_args()
 
     num_inference_steps = args.num_inference_steps
@@ -211,24 +462,61 @@ def main():
             logging.warning(f"CUDA not found: Reducing num_inference_steps to {num_inference_steps_non_cuda}")
             num_inference_steps = num_inference_steps_non_cuda
 
-    pipe = MarigoldDepthCompletionPipeline.from_pretrained(args.checkpoint, prediction_type="depth").to(device)
+    pipe = MarigoldDepthCompletionPipeline_fp16.from_pretrained(args.checkpoint, prediction_type="depth").to(device)
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
-
     if not torch.cuda.is_available():
         logging.warning("CUDA not found: Using a lightweight VAE")
         del pipe.vae
         pipe.vae = diffusers.AutoencoderTiny.from_pretrained("madebyollin/taesd").to(device)
 
+    """
     pred = pipe(
         image=Image.open(args.in_image),
         sparse_depth=np.load(args.in_depth),
         num_inference_steps=num_inference_steps,
         processing_resolution=processing_resolution,
     )
+    """
+    # files_path = "/cephfs/jongmin/naverlabs/erp_dc/ERP-CMP/cmp_image"
+    files_path = "/cephfs/jongmin/naverlabs/erp_dc/ERP-CMP/lidar_cmp_image"
 
-    np.save(args.out_depth, pred)
-    vis = pipe.image_processor.visualize_depth(pred, val_min=pred.min(), val_max=pred.max())[0]
-    vis.save(os.path.splitext(args.out_depth)[0] + "_vis.jpg")
+    file_names = os.listdir(files_path)
+    
+    rgb_filenames = [os.path.join(files_path, file_name) for file_name in file_names if "rgb" in file_name]
+    depth_filenames = [os.path.join(files_path, file_name) for file_name in file_names if "depth" in file_name]
+    
+    rgb_filenames.sort()
+    depth_filenames.sort()
+
+    rmse_list = []
+    for ind in range(len(rgb_filenames)):
+        rgb_filename = rgb_filenames[ind]
+        depth_filename = depth_filenames[ind]
+
+        full_depth = np.load(depth_filename)
+        sparse_depth = full_depth.copy()
+        print((sparse_depth>0).sum())
+        # sparse_mask = create_random_mask(sparse_depth.shape, ratio=0.1)
+        # sparse_depth[~sparse_mask] = 0
+
+        pred = pipe(
+            image=Image.open(rgb_filename),
+            sparse_depth= sparse_depth,
+            num_inference_steps=num_inference_steps,
+            processing_resolution=processing_resolution,
+            seed=args.seed
+        )
+        # np.save('./marigold_result_seed/{}_{}'.format("seed"+str(args.seed)+"_",str(os.path.basename(rgb_filename)).replace('.jpg', '.npy')), pred.squeeze())
+        np.save('./marigold_lidar_result/{}'.format("seed"+str(args.seed)+"__"+str(os.path.basename(rgb_filename)).replace('.jpg', '.npy')), pred.squeeze())
+        print("seed"+str(args.seed)+"_"+str(os.path.basename(rgb_filename)).replace('.jpg', '.npy'))
+        rmse, _ = calculate_depth_rmse(pred, full_depth)
+        print(rgb_filename)
+        rmse_list.append(rmse)
+        print(rmse)
+    rmse_arr = np.array(rmse_list)
+    # np.save(args.out_depth, pred)
+    # vis = pipe.image_processor.visualize_depth(pred, val_min=pred.min(), val_max=pred.max())[0]
+    # vis.save(os.path.splitext(args.out_depth)[0] + "_vis.jpg")
 
 
 if __name__ == "__main__":
